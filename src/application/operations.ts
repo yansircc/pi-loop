@@ -30,10 +30,11 @@ const cronSpec = (expression: string, config: LoopConfig) => ({
 });
 
 export const makeLoopOperations = (repository: LoopRepository, config: LoopConfig) => {
-  const createFixed = (interval: string, prompt: string) =>
+  const createInterval = (periodMs: number, prompt: string, runImmediately = true) =>
     Effect.gen(function* () {
-      const periodMs = parseIntervalMs(interval);
-      if (!periodMs) return yield* new InvalidSchedule({ input: interval });
+      if (!Number.isSafeInteger(periodMs) || periodMs < 1_000) {
+        return yield* new InvalidSchedule({ input: String(periodMs) });
+      }
       const now = yield* Clock.currentTimeMillis;
       const id = loopId();
       const loop = createLoop({
@@ -42,7 +43,7 @@ export const makeLoopOperations = (repository: LoopRepository, config: LoopConfi
         prompt,
         retention: "session",
         createdAt: now,
-        firstDueAt: now,
+        firstDueAt: runImmediately ? now : now + periodMs,
         spec: {
           periodMs,
           jitterFraction: config.recurringJitterFraction,
@@ -54,18 +55,21 @@ export const makeLoopOperations = (repository: LoopRepository, config: LoopConfi
       return loop;
     });
 
+  const createFixed = (interval: string, prompt: string, runImmediately = true) => {
+    const periodMs = parseIntervalMs(interval);
+    return periodMs
+      ? createInterval(periodMs, prompt, runImmediately)
+      : Effect.fail(new InvalidSchedule({ input: interval }));
+  };
+
   const createDynamic = (prompt: string) =>
     Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
       const id = loopId();
-      const storedPrompt =
-        `${prompt}\n\n[pi-loop: dynamic loop ${id}. After this iteration call ` +
-        `schedule_wakeup with loopId "${id}" and a delay of 60-3600 seconds. ` +
-        "Omit the call to stop.]";
       const loop = createLoop({
         _tag: "Manual",
         id,
-        prompt: storedPrompt,
+        prompt,
         retention: "session",
         createdAt: now,
         firstDueAt: now,
@@ -114,14 +118,32 @@ export const makeLoopOperations = (repository: LoopRepository, config: LoopConfi
       return yield* repository.arm(id, now + Math.floor(delaySeconds * 1_000));
     });
 
+  const updateInterval = (id: string, periodMs: number, prompt: string) =>
+    Effect.gen(function* () {
+      if (!Number.isSafeInteger(periodMs) || periodMs < 1_000) {
+        return yield* new InvalidSchedule({ input: String(periodMs) });
+      }
+      const now = yield* Clock.currentTimeMillis;
+      return yield* repository.updateInterval(id, periodMs, prompt, now);
+    });
+
+  const removeAll = Effect.gen(function* () {
+    const session = yield* repository.removeAll("session");
+    const project = yield* repository.removeAll("project");
+    return [...session, ...project];
+  });
+
   return {
+    createInterval,
     createFixed,
     createDynamic,
     createCron,
     scheduleWakeup,
+    updateInterval,
+    setEnabled: repository.setEnabled,
     list: repository.list,
     remove: repository.remove,
-    removeAll: repository.removeAll,
+    removeAll,
   } as const;
 };
 

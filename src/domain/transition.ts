@@ -1,5 +1,12 @@
 import { nextCronDue } from "./cron.js";
-import type { CronLoop, IntervalLoop, Loop, Occurrence, Waiting } from "./model.js";
+import {
+  occurrencePrompt,
+  type CronLoop,
+  type IntervalLoop,
+  type Loop,
+  type Occurrence,
+  type Waiting,
+} from "./model.js";
 
 export type Gate = "open" | "closed";
 
@@ -12,9 +19,10 @@ const occurrence = (loop: Loop, phase: Waiting, claimedAt: number): Occurrence =
   id: `${loop.id}:${phase.cursor}`,
   loopId: loop.id,
   cursor: phase.cursor,
-  prompt: loop.prompt,
+  prompt: occurrencePrompt(loop),
   dueAt: phase.dueAt,
   claimedAt,
+  trigger: "scheduled",
 });
 
 const stop = (loop: Loop, reason: "completed" | "cancelled" | "expired"): Loop => ({
@@ -64,7 +72,12 @@ const advanceInterval = (loop: IntervalLoop, now: number): IntervalLoop => {
 };
 
 export const tick = (loop: Loop, now: number, gate: Gate): TransitionResult => {
-  if (gate === "closed" || loop.phase._tag !== "Waiting" || now < loop.phase.dueAt) {
+  if (
+    !loop.enabled ||
+    gate === "closed" ||
+    loop.phase._tag !== "Waiting" ||
+    now < loop.phase.dueAt
+  ) {
     return { loop };
   }
   const claimed = occurrence(loop, loop.phase, now);

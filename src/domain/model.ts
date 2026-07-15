@@ -62,6 +62,8 @@ const BaseFields = {
   id: LoopId,
   prompt: Prompt,
   createdAt: NonNegativeInt,
+  enabled: Schema.Boolean,
+  manualCursor: NonNegativeInt,
   label: optional(NonBlankString),
 };
 
@@ -100,8 +102,48 @@ export type ManualLoop = Schema.Schema.Type<typeof ManualLoop>;
 export const Loop = Schema.Union([OnceLoop, CronLoop, IntervalLoop, ManualLoop]);
 export type Loop = Schema.Schema.Type<typeof Loop>;
 
-export const DurableFile = Schema.Struct({
+const LegacyBaseFields = {
+  id: LoopId,
+  prompt: Prompt,
+  createdAt: NonNegativeInt,
+  label: optional(NonBlankString),
+};
+
+const LegacyLoop = Schema.Union([
+  Schema.TaggedStruct("Once", {
+    ...LegacyBaseFields,
+    retention: Retention,
+    phase: Schema.Union([Waiting, Stopped]),
+  }),
+  Schema.TaggedStruct("Cron", {
+    ...LegacyBaseFields,
+    retention: Retention,
+    spec: CronSpec,
+    until: optional(NonNegativeInt),
+    phase: Schema.Union([Waiting, Stopped]),
+  }),
+  Schema.TaggedStruct("Interval", {
+    ...LegacyBaseFields,
+    retention: Retention,
+    spec: IntervalSpec,
+    until: optional(NonNegativeInt),
+    phase: Schema.Union([Waiting, Stopped]),
+  }),
+  Schema.TaggedStruct("Manual", {
+    ...LegacyBaseFields,
+    retention: Schema.Literal("session"),
+    phase: Schema.Union([Waiting, AwaitingArm, Stopped]),
+  }),
+]);
+export type LegacyLoop = Schema.Schema.Type<typeof LegacyLoop>;
+
+export const DurableFileV1 = Schema.Struct({
   version: Schema.Literal(1),
+  loops: Schema.Array(LegacyLoop),
+});
+
+export const DurableFile = Schema.Struct({
+  version: Schema.Literal(2),
   loops: Schema.Array(Loop),
 });
 export type DurableFile = Schema.Schema.Type<typeof DurableFile>;
@@ -134,6 +176,7 @@ export type Occurrence = {
   readonly prompt: Prompt;
   readonly dueAt: number;
   readonly claimedAt: number;
+  readonly trigger: "scheduled" | "manual";
 };
 
 export type CreateLoop =
@@ -184,6 +227,8 @@ export const createLoop = (input: CreateLoop): Loop => {
     prompt: input.prompt,
     retention: input.retention,
     createdAt: input.createdAt,
+    enabled: true,
+    manualCursor: 0,
     ...(input.label === undefined ? {} : { label: input.label }),
   };
   switch (input._tag) {
@@ -217,4 +262,19 @@ export const createLoop = (input: CreateLoop): Loop => {
         phase: { _tag: "Waiting", dueAt: input.firstDueAt, cursor: 0 },
       };
   }
+};
+
+const dynamicInstruction = (id: string) =>
+  `\n\n[pi-loop: dynamic loop ${id}. After this iteration call ` +
+  `schedule_wakeup with loopId "${id}" and a delay of 60-3600 seconds. ` +
+  "Omit the call to stop.]";
+
+export const occurrencePrompt = (loop: Loop): Prompt =>
+  loop._tag === "Manual" ? `${loop.prompt}${dynamicInstruction(loop.id)}` : loop.prompt;
+
+export const migrateLegacyLoop = (loop: LegacyLoop): Loop => {
+  const suffix = loop._tag === "Manual" ? dynamicInstruction(loop.id) : "";
+  const prompt =
+    suffix && loop.prompt.endsWith(suffix) ? loop.prompt.slice(0, -suffix.length) : loop.prompt;
+  return { ...loop, prompt, enabled: true, manualCursor: 0 } as Loop;
 };

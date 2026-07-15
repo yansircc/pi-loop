@@ -4,6 +4,9 @@ import { Path } from "effect/Path";
 import { arm as armTransition, cancel, tick, type Gate } from "../domain/transition.js";
 import {
   DurableFile,
+  DurableFileV1,
+  migrateLegacyLoop,
+  occurrencePrompt,
   type Loop,
   type LoopConfig,
   type LoopId,
@@ -33,7 +36,7 @@ export class LoopStateConflict extends Data.TaggedError("LoopStateConflict")<{
   readonly expected: string;
 }> {}
 
-type MutationError =
+export type MutationError =
   | RepositoryFailure
   | LeaseUnavailable
   | CapacityExceeded
@@ -46,13 +49,33 @@ export type LoopRepository = {
   readonly list: Effect.Effect<ReadonlyArray<Loop>>;
   readonly get: (id: LoopId) => Effect.Effect<Loop, LoopNotFound>;
   readonly remove: (id: LoopId) => Effect.Effect<Loop, MutationError>;
-  readonly removeAll: Effect.Effect<ReadonlyArray<Loop>, RepositoryFailure | LeaseUnavailable>;
+  readonly removeAll: (
+    retention: Loop["retention"],
+  ) => Effect.Effect<ReadonlyArray<Loop>, RepositoryFailure | LeaseUnavailable>;
   readonly arm: (id: LoopId, at: number) => Effect.Effect<Loop, MutationError>;
+  readonly updateInterval: (
+    id: LoopId,
+    periodMs: number,
+    prompt: string,
+    now: number,
+  ) => Effect.Effect<Loop, MutationError>;
+  readonly setEnabled: (id: LoopId, enabled: boolean) => Effect.Effect<Loop, MutationError>;
+  readonly claimNow: (
+    id: LoopId,
+    now: number,
+    gate: Gate,
+  ) => Effect.Effect<Occurrence, MutationError>;
   readonly claimDue: (
     now: number,
     gate: Gate,
+    retention: Loop["retention"],
   ) => Effect.Effect<ReadonlyArray<Occurrence>, RepositoryFailure>;
   readonly release: Effect.Effect<void, RepositoryFailure>;
+};
+
+export type SessionLoopPersistence = {
+  readonly initial: ReadonlyArray<Loop>;
+  readonly persist: (loops: ReadonlyArray<Loop>) => Effect.Effect<void, RepositoryFailure>;
 };
 
 const repositoryFailure =
@@ -83,14 +106,20 @@ const isPidAlive = (pid: number) =>
     }),
   );
 
+const PersistedFile = Schema.Union([DurableFile, DurableFileV1]);
+
 const decodeDurableFile = (encoded: string, filePath: string) =>
-  Schema.decodeUnknownEffect(Schema.fromJsonString(DurableFile), {
+  Schema.decodeUnknownEffect(Schema.fromJsonString(PersistedFile), {
     onExcessProperty: "error",
-  })(encoded).pipe(Effect.mapError(repositoryFailure("load", `Invalid durable file ${filePath}`)));
+  })(encoded).pipe(
+    Effect.map((file) => (file.version === 1 ? file.loops.map(migrateLegacyLoop) : file.loops)),
+    Effect.mapError(repositoryFailure("load", `Invalid durable file ${filePath}`)),
+  );
 
 export const makeLoopRepository = (
   cwd: string,
   config: LoopConfig,
+  sessionPersistence?: SessionLoopPersistence,
 ): Effect.Effect<LoopRepository, RepositoryFailure, FileSystem | Path> =>
   Effect.gen(function* () {
     const fs = yield* FileSystem;
@@ -141,8 +170,17 @@ export const makeLoopRepository = (
             .pipe(Effect.mapError(repositoryFailure("load", `Could not read ${filePath}`)));
           return yield* decodeDurableFile(encoded, filePath);
         }).pipe(Effect.onError(() => fs.remove(lockPath, { force: true }).pipe(Effect.ignore)));
-        for (const loop of durable.loops) loaded.set(loop.id, loop);
+        for (const loop of durable) loaded.set(loop.id, loop);
       }
+    }
+    for (const loop of sessionPersistence?.initial ?? []) {
+      if (loaded.has(loop.id)) {
+        return yield* new RepositoryFailure({
+          operation: "load",
+          message: `Duplicate loop id ${loop.id}`,
+        });
+      }
+      loaded.set(loop.id, loop);
     }
     const state = yield* Ref.make<ReadonlyMap<LoopId, Loop>>(loaded);
 
@@ -150,7 +188,7 @@ export const makeLoopRepository = (
       Effect.gen(function* () {
         const loops = [...next.values()].filter((loop) => loop.retention === "project");
         const encoded = yield* Schema.encodeUnknownEffect(Schema.fromJsonString(DurableFile))({
-          version: 1,
+          version: 2,
           loops,
         }).pipe(Effect.mapError(repositoryFailure("persist", `Could not encode ${filePath}`)));
         const temporary = `${filePath}.staging-${globalThis.crypto.randomUUID()}`;
@@ -168,16 +206,20 @@ export const makeLoopRepository = (
     const commit = (
       current: ReadonlyMap<LoopId, Loop>,
       next: ReadonlyMap<LoopId, Loop>,
-      touchesProject: boolean,
+      retention: Loop["retention"],
     ) =>
       Effect.gen(function* () {
-        if (touchesProject) {
+        if (retention === "project") {
           if (!leaseOwned) {
             return yield* new LeaseUnavailable({
               message: "Another Pi session owns project-retained loops",
             });
           }
           yield* persist(next);
+        } else if (sessionPersistence) {
+          yield* sessionPersistence.persist(
+            [...next.values()].filter((loop) => loop.retention === "session"),
+          );
         }
         if (current !== next) yield* Ref.set(state, next);
       });
@@ -194,7 +236,7 @@ export const makeLoopRepository = (
           }
           const next = new Map(current);
           next.set(loop.id, loop);
-          yield* commit(current, next, loop.retention === "project");
+          yield* commit(current, next, loop.retention);
         }),
       );
 
@@ -215,7 +257,7 @@ export const makeLoopRepository = (
           const next = new Map(current);
           next.set(id, cancel(loop));
           next.delete(id);
-          yield* commit(current, next, loop.retention === "project");
+          yield* commit(current, next, loop.retention);
           return loop;
         }),
       );
@@ -232,35 +274,100 @@ export const makeLoopRepository = (
           }
           const next = new Map(current);
           next.set(id, armed);
-          yield* commit(current, next, false);
+          yield* commit(current, next, loop.retention);
           return armed;
         }),
       );
 
-    const removeAll = mutationLock
-      .withPermits(1)(
+    const updateInterval = (id: LoopId, periodMs: number, prompt: string, now: number) =>
+      mutationLock.withPermits(1)(
         Effect.gen(function* () {
           const current = yield* Ref.get(state);
-          const loops = [...current.values()];
-          const touchesProject = loops.some((loop) => loop.retention === "project");
-          const next = new Map<LoopId, Loop>();
-          yield* commit(current, next, touchesProject);
-          return loops;
+          const loop = current.get(id);
+          if (!loop) return yield* new LoopNotFound({ id });
+          if (loop._tag !== "Interval") {
+            return yield* new LoopStateConflict({ id, expected: "fixed-interval automation" });
+          }
+          const updated: Loop = {
+            ...loop,
+            prompt,
+            spec: { ...loop.spec, periodMs },
+            phase:
+              loop.phase._tag === "Waiting" ? { ...loop.phase, dueAt: now + periodMs } : loop.phase,
+          };
+          const next = new Map(current);
+          next.set(id, updated);
+          yield* commit(current, next, loop.retention);
+          return updated;
         }),
-      )
-      .pipe(
-        Effect.mapError((error) =>
-          error instanceof LeaseUnavailable
-            ? error
-            : new RepositoryFailure({
-                operation: "persist",
-                message: "Could not remove all loops",
-                cause: error,
-              }),
-        ),
       );
 
-    const claimDue = (now: number, gate: Gate) =>
+    const setEnabled = (id: LoopId, enabled: boolean) =>
+      mutationLock.withPermits(1)(
+        Effect.gen(function* () {
+          const current = yield* Ref.get(state);
+          const loop = current.get(id);
+          if (!loop) return yield* new LoopNotFound({ id });
+          const updated = { ...loop, enabled } as Loop;
+          const next = new Map(current);
+          next.set(id, updated);
+          yield* commit(current, next, loop.retention);
+          return updated;
+        }),
+      );
+
+    const claimNow = (id: LoopId, now: number, gate: Gate) =>
+      mutationLock.withPermits(1)(
+        Effect.gen(function* () {
+          if (gate === "closed")
+            return yield* new LoopStateConflict({ id, expected: "idle session" });
+          const current = yield* Ref.get(state);
+          const loop = current.get(id);
+          if (!loop) return yield* new LoopNotFound({ id });
+          if (!loop.enabled)
+            return yield* new LoopStateConflict({ id, expected: "enabled automation" });
+          const cursor = loop.manualCursor + 1;
+          const updated = { ...loop, manualCursor: cursor } as Loop;
+          const next = new Map(current);
+          next.set(id, updated);
+          yield* commit(current, next, loop.retention);
+          return {
+            id: `${id}:manual:${cursor}`,
+            loopId: id,
+            cursor,
+            prompt: occurrencePrompt(loop),
+            dueAt: now,
+            claimedAt: now,
+            trigger: "manual" as const,
+          };
+        }),
+      );
+
+    const removeAll = (retention: Loop["retention"]) =>
+      mutationLock
+        .withPermits(1)(
+          Effect.gen(function* () {
+            const current = yield* Ref.get(state);
+            const loops = [...current.values()].filter((loop) => loop.retention === retention);
+            const next = new Map(current);
+            for (const loop of loops) next.delete(loop.id);
+            yield* commit(current, next, retention);
+            return loops;
+          }),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            error instanceof LeaseUnavailable
+              ? error
+              : new RepositoryFailure({
+                  operation: "persist",
+                  message: "Could not remove all loops",
+                  cause: error,
+                }),
+          ),
+        );
+
+    const claimDue = (now: number, gate: Gate, retention: Loop["retention"]) =>
       mutationLock
         .withPermits(1)(
           Effect.gen(function* () {
@@ -270,14 +377,15 @@ export const makeLoopRepository = (
             const occurrences: Array<Occurrence> = [];
             let touchesProject = false;
             for (const loop of current.values()) {
+              if (loop.retention !== retention) continue;
               const result = tick(loop, now, gate);
               if (!result.occurrence) continue;
               occurrences.push(result.occurrence);
-              if (loop.retention === "project") touchesProject = true;
+              touchesProject = true;
               if (result.loop.phase._tag === "Stopped") next.delete(loop.id);
               else next.set(loop.id, result.loop);
             }
-            yield* commit(current, next, touchesProject);
+            if (touchesProject) yield* commit(current, next, retention);
             return occurrences;
           }),
         )
@@ -307,6 +415,9 @@ export const makeLoopRepository = (
       remove,
       removeAll,
       arm: armLoop,
+      updateInterval,
+      setEnabled,
+      claimNow,
       claimDue,
       release,
     };

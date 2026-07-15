@@ -5,7 +5,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { layer as nodeServicesLayer, type NodeServices } from "@effect/platform-node/NodeServices";
 import { Type } from "@sinclair/typebox";
-import { Data, Effect, Fiber, ManagedRuntime } from "effect";
+import { Clock, Data, Effect, Fiber, ManagedRuntime, Schema } from "effect";
 import { loadLoopConfig } from "../application/config.js";
 import { makeLoopOperations, type LoopOperations } from "../application/operations.js";
 import { makeLoopRepository, type LoopRepository } from "../application/repository.js";
@@ -13,6 +13,8 @@ import { makeScheduler, PromptDeliveryFailure, type Scheduler } from "../applica
 import { cronToHuman } from "../domain/cron.js";
 import type { Loop, LoopConfig, Occurrence } from "../domain/model.js";
 import { parseLoop } from "./parse-loop.js";
+import { LoopControlRequest, projectLoops } from "./status.js";
+import { makeSessionLoopPersistence } from "./session-state.js";
 
 const runtime = ManagedRuntime.make(nodeServicesLayer);
 
@@ -82,15 +84,44 @@ const notifyFailure = (context: ExtensionContext, error: unknown) =>
 const refreshStatus = (active: Session) =>
   active.repository.list.pipe(
     Effect.flatMap((loops) =>
+      Clock.currentTimeMillis.pipe(Effect.map((observedAt) => ({ loops, observedAt }))),
+    ),
+    Effect.flatMap(({ loops, observedAt }) =>
       Effect.sync(() => {
         if (!active.context.hasUI) return;
+        const ui = active.context.ui as typeof active.context.ui & {
+          setStructuredStatus?: (key: string, value?: unknown) => void;
+        };
         active.context.ui.setStatus(
           "pi-loop",
           loops.length === 0 ? undefined : `${loops.length} loop${loops.length === 1 ? "" : "s"}`,
         );
+        ui.setStructuredStatus?.("pi-loop", {
+          kind: "pi-loop/status",
+          version: 1,
+          sessionId: active.context.sessionManager.getSessionId(),
+          observedAt,
+          loops: projectLoops(loops),
+        });
+        ui.setStructuredStatus?.(
+          "pi-loop/runtime-lease",
+          loops[0]
+            ? {
+                kind: "pi/runtime-lease",
+                version: 1,
+                owner: "pi-loop",
+                reason: "automation-present",
+              }
+            : undefined,
+        );
       }),
     ),
   );
+
+const decodeControl = (input: string) =>
+  Schema.decodeUnknownEffect(Schema.fromJsonString(LoopControlRequest), {
+    onExcessProperty: "error",
+  })(input);
 
 const stopSession = (pi: ExtensionAPI, active: Session) =>
   Fiber.interrupt(active.fiber).pipe(
@@ -103,7 +134,8 @@ const startSession = (pi: ExtensionAPI, context: ExtensionContext) =>
     const previous = sessions.get(pi as object);
     if (previous) yield* stopSession(pi, previous);
     const config = yield* loadLoopConfig(context.cwd);
-    const repository = yield* makeLoopRepository(context.cwd, config);
+    const sessionPersistence = yield* makeSessionLoopPersistence(pi, context);
+    const repository = yield* makeLoopRepository(context.cwd, config, sessionPersistence);
     const operations = makeLoopOperations(repository, config);
     const deliver = (item: Occurrence) =>
       Effect.try({
@@ -213,7 +245,7 @@ export default function piLoop(pi: ExtensionAPI): void {
             if (id === "all") yield* active.operations.removeAll;
             else yield* active.operations.remove(id);
           }).pipe(
-            Effect.tap(() => refreshStatus(active)),
+            Effect.ensuring(refreshStatus(active)),
             Effect.tap(() =>
               Effect.sync(() => {
                 if (context.hasUI) context.ui.notify(`Cancelled ${id}`, "info");
@@ -224,6 +256,44 @@ export default function piLoop(pi: ExtensionAPI): void {
           Effect.catch((error) => notifyFailure(context, error)),
           Effect.asVoid,
         ),
+      );
+    },
+  });
+
+  pi.registerCommand("loop-control", {
+    description: "Typed pi-web control surface for the current session automation",
+    handler(args, context) {
+      return run(
+        withSession(pi, (active) =>
+          Effect.gen(function* () {
+            const request = yield* decodeControl(args);
+            switch (request.action._tag) {
+              case "CreateInterval":
+                yield* active.operations.createInterval(
+                  request.action.periodMs,
+                  request.action.prompt,
+                  false,
+                );
+                break;
+              case "UpdateInterval":
+                yield* active.operations.updateInterval(
+                  request.action.id,
+                  request.action.periodMs,
+                  request.action.prompt,
+                );
+                break;
+              case "SetEnabled":
+                yield* active.operations.setEnabled(request.action.id, request.action.enabled);
+                break;
+              case "Delete":
+                yield* active.operations.remove(request.action.id);
+                break;
+              case "RunNow":
+                yield* active.scheduler.runNow(request.action.id);
+                break;
+            }
+          }).pipe(Effect.ensuring(refreshStatus(active))),
+        ).pipe(Effect.tapError((error) => notifyFailure(context, error))),
       );
     },
   });
@@ -276,7 +346,7 @@ export default function piLoop(pi: ExtensionAPI): void {
             if (id === "all") yield* active.operations.removeAll;
             else yield* active.operations.remove(id);
           }).pipe(
-            Effect.tap(() => refreshStatus(active)),
+            Effect.ensuring(refreshStatus(active)),
             Effect.map(() => toolResult(`Cancelled ${parameters.id ?? ""}`)),
           ),
         ).pipe(

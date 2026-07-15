@@ -1,6 +1,6 @@
 import { expect, it } from "@effect/vitest";
 import { layer as nodeServicesLayer } from "@effect/platform-node/NodeServices";
-import { Cause, Effect } from "effect";
+import { Cause, Effect, Ref } from "effect";
 import { FileSystem } from "effect/FileSystem";
 import { Path } from "effect/Path";
 import { LeaseUnavailable, makeLoopRepository } from "../src/application/repository.js";
@@ -31,13 +31,13 @@ it.effect("commits durable advance before returning an occurrence", () =>
         dueAt: 10,
       });
       yield* repository.add(loop);
-      const occurrences = yield* repository.claimDue(10, "open");
+      const occurrences = yield* repository.claimDue(10, "open", "project");
       expect(occurrences.map((item) => item.id)).toEqual(["durable-once:0"]);
       expect(yield* repository.list).toEqual([]);
       const encoded = yield* fs.readFileString(
         path.join(directory, DEFAULT_CONFIG.durableFilePath),
       );
-      expect(JSON.parse(encoded)).toEqual({ version: 1, loops: [] });
+      expect(JSON.parse(encoded)).toEqual({ version: 2, loops: [] });
       yield* repository.release;
     }),
   ),
@@ -91,6 +91,64 @@ it.effect("fails closed on corrupt durable state", () =>
       expect(yield* fs.exists(`${path.join(directory, DEFAULT_CONFIG.durableFilePath)}.lock`)).toBe(
         false,
       );
+    }),
+  ),
+);
+
+it.effect("migrates published v1 durable loops into the v2 state algebra", () =>
+  withDirectory((directory, fs, path) =>
+    Effect.gen(function* () {
+      const filePath = path.join(directory, DEFAULT_CONFIG.durableFilePath);
+      yield* fs.writeFileString(
+        filePath,
+        JSON.stringify({
+          version: 1,
+          loops: [
+            {
+              _tag: "Once",
+              id: "legacy-once",
+              prompt: "inspect",
+              retention: "project",
+              createdAt: 1,
+              phase: { _tag: "Waiting", dueAt: 10, cursor: 0 },
+            },
+          ],
+        }),
+      );
+      const repository = yield* makeLoopRepository(directory, DEFAULT_CONFIG);
+      expect(yield* repository.list).toEqual([
+        expect.objectContaining({ id: "legacy-once", enabled: true, manualCursor: 0 }),
+      ]);
+      yield* repository.setEnabled("legacy-once", false);
+      expect(JSON.parse(yield* fs.readFileString(filePath))).toMatchObject({ version: 2 });
+      yield* repository.release;
+    }),
+  ),
+);
+
+it.effect("persists every session-owned mutation through the session adapter", () =>
+  withDirectory((directory) =>
+    Effect.gen(function* () {
+      const snapshots = yield* Ref.make<ReadonlyArray<ReadonlyArray<unknown>>>([]);
+      const repository = yield* makeLoopRepository(directory, DEFAULT_CONFIG, {
+        initial: [],
+        persist: (loops) =>
+          Ref.update(snapshots, (values) => [...values, loops]).pipe(Effect.asVoid),
+      });
+      const loop = createLoop({
+        _tag: "Interval",
+        id: "session-interval",
+        prompt: "inspect",
+        retention: "session",
+        createdAt: 1,
+        firstDueAt: 10,
+        spec: { periodMs: 100, jitterFraction: 0, jitterCapMs: 0 },
+      });
+      yield* repository.add(loop);
+      yield* repository.setEnabled(loop.id, false);
+      yield* repository.remove(loop.id);
+      expect((yield* Ref.get(snapshots)).map((snapshot) => snapshot.length)).toEqual([1, 1, 0]);
+      yield* repository.release;
     }),
   ),
 );

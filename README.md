@@ -35,8 +35,13 @@ Missed recurring occurrences coalesce into one claim.
 
 ## State and delivery
 
-Session loops remain in memory. Durable cron and one-shot loops are stored in `.pi-loop.json`.
-One PID lease owns durable mutation; follower sessions may still run session loops.
+Session loops are stored as versioned custom entries in the owning Pi session. Forked sessions do
+not inherit them. Durable cron and one-shot loops are stored in `.pi-loop.json`. One PID lease owns
+durable mutation; follower sessions may still run session loops.
+
+When the extension runs inside pi-web it also exposes a structured multi-loop status and a typed
+control command. pi-web keeps a session runtime alive while at least one loop exists. If pi-web is
+stopped, no loop runs; reopening the session restores state and coalesces an overdue occurrence.
 
 Delivery is at-most-once after claim: durable state commits before Pi receives the prompt. A failed
 commit emits no occurrence; a Pi failure after commit is logged and is not retried.
