@@ -87,21 +87,11 @@ jobs:
       id-token: write
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v6
-
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 24.11.0
-          cache: pnpm
           registry-url: https://registry.npmjs.org
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
 
       - name: Download verified archive
         uses: actions/download-artifact@v8
@@ -124,6 +114,31 @@ jobs:
             --no-fund
           npm publish ./release/package.tgz --access public --provenance
 
+  verify-public:
+    name: Verify public package
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.11.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
       - name: Verify public installation
         shell: bash
         env:
@@ -133,7 +148,7 @@ jobs:
           package_version="$(node --print "require('./package.json').version")"
           package_spec="${package_name}@${package_version}"
           visible=false
-          for attempt in {1..12}; do
+          for attempt in {1..60}; do
             if npm view "${package_spec}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
               visible=true
               break
