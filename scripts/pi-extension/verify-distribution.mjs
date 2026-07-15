@@ -137,13 +137,13 @@ const verifyWithPiLoader = async (packageRoot, harnessRoot) => {
   const extension = result.extensions[0];
   assert.ok(extension);
   for (const command of config.expected.commands) {
-    assert.ok(extension.commands.has(command), `archive did not register /${command}`);
+    assert.ok(extension.commands.has(command), `archive did not register /${String(command)}`);
   }
   for (const tool of config.expected.tools) {
-    assert.ok(extension.tools.has(tool), `archive did not register ${tool}`);
+    assert.ok(extension.tools.has(tool), `archive did not register ${String(tool)}`);
   }
   for (const handler of config.expected.handlers) {
-    assert.ok(extension.handlers.has(handler), `archive did not register ${handler}`);
+    assert.ok(extension.handlers.has(handler), `archive did not register ${String(handler)}`);
   }
   return {
     errors: result.errors,
