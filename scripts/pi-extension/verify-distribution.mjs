@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
-  copyFileSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
@@ -9,22 +9,26 @@ import {
   rmSync,
   statSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { parse } from "acorn";
 import crossSpawn from "cross-spawn";
-import { x as extractArchive } from "tar";
+import { t as listArchive, x as extractArchive } from "tar";
 import config from "./config.mjs";
 import {
   isAllowedExternal,
+  isStandardDocument,
   projectRoot,
   readDistributionContract,
 } from "./distribution-contract.mjs";
 
-const run = (command, args, cwd = projectRoot) => {
+const projectManifest = JSON.parse(readFileSync(resolve(projectRoot, "package.json"), "utf8"));
+const packageManager = String(projectManifest.packageManager ?? "npm").split("@")[0];
+
+const run = (command, args, options = {}) => {
   const result = crossSpawn.sync(command, args, {
-    cwd,
+    cwd: options.cwd ?? projectRoot,
     encoding: "utf8",
+    env: options.env ?? process.env,
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) {
@@ -32,6 +36,7 @@ const run = (command, args, cwd = projectRoot) => {
     process.stderr.write(result.stderr ?? "");
     throw new Error(`${command} ${args.join(" ")} failed with exit ${result.status}`);
   }
+  return result.stdout ?? "";
 };
 
 const listFiles = (root) => {
@@ -46,7 +51,7 @@ const listFiles = (root) => {
       else files.push(relative(root, path).split(sep).join("/"));
     }
   }
-  return files.sort();
+  return files.sort((left, right) => left.localeCompare(right));
 };
 
 const inspectModule = (source) => {
@@ -68,7 +73,7 @@ const inspectModule = (source) => {
     ) {
       if (node.source) imports.add(String(node.source.value));
     } else if (node.type === "ImportExpression") {
-      assert.equal(node.source?.type, "Literal", "dynamic import must be literal");
+      assert.equal(node.source?.type, "Literal", "dynamic import must use a literal specifier");
       imports.add(String(node.source.value));
     } else if (
       node.type === "CallExpression" &&
@@ -86,150 +91,227 @@ const inspectModule = (source) => {
 
 const verifyBundle = (contract) => {
   assert.ok(existsSync(contract.entryAbsolute), `missing bundle: ${contract.entryRelative}`);
-  assert.deepEqual(listFiles(contract.outputDirectory), [contract.outputFileName]);
+  assert.deepEqual(
+    listFiles(contract.outputDirectory),
+    [contract.outputFileName],
+    "Pi bundle directory must contain only the declared entry",
+  );
   const imports = inspectModule(readFileSync(contract.entryAbsolute, "utf8"));
   const forbidden = imports.filter((specifier) => !isAllowedExternal(specifier));
-  assert.deepEqual(forbidden, [], `unbundled runtime imports: ${forbidden.join(", ")}`);
+  assert.deepEqual(
+    forbidden,
+    [],
+    `bundle contains non-host runtime imports: ${forbidden.join(", ")}`,
+  );
   return imports;
 };
 
-const verifyWithPiLoader = async (packageRoot) => {
-  const host = await import(config.loaderModule);
-  assert.equal(typeof host.discoverAndLoadExtensions, "function");
+const verifyAssets = (contract) => {
+  for (const asset of contract.assets) {
+    assert.equal(asset.exists, true, `missing declared asset: ${asset.relative}`);
+    if (asset.kind === "directory") {
+      assert.ok(
+        listFiles(asset.absolute).length > 0,
+        `declared asset directory is empty: ${asset.relative}`,
+      );
+    }
+  }
+  return contract.assets.map(({ relative: path, kind }) => ({ path, kind }));
+};
+
+const verifyWithPiLoader = async (packageRoot, harnessRoot) => {
+  const loaderModule = config.hostModules[0];
+  const host = await import(loaderModule);
+  assert.equal(
+    typeof host.discoverAndLoadExtensions,
+    "function",
+    `${loaderModule} does not export discoverAndLoadExtensions`,
+  );
   const result = await host.discoverAndLoadExtensions(
     [packageRoot],
-    packageRoot,
-    resolve(packageRoot, ".pi-agent-test"),
+    harnessRoot,
+    resolve(harnessRoot, ".pi-agent-test"),
   );
   assert.deepEqual(result.errors, [], "Pi extension loader reported errors");
   assert.equal(result.extensions.length, 1, "Pi loader must load exactly one extension");
   const extension = result.extensions[0];
   assert.ok(extension);
   for (const command of config.expected.commands) {
-    assert.ok(extension.commands.has(command), `bundle did not register /${command}`);
+    assert.ok(extension.commands.has(command), `archive did not register /${command}`);
   }
   for (const tool of config.expected.tools) {
-    assert.ok(extension.tools.has(tool), `bundle did not register ${tool}`);
+    assert.ok(extension.tools.has(tool), `archive did not register ${tool}`);
   }
   for (const handler of config.expected.handlers) {
-    assert.ok(extension.handlers.has(handler), `bundle did not register ${handler}`);
+    assert.ok(extension.handlers.has(handler), `archive did not register ${handler}`);
   }
   return {
-    commands: config.expected.commands,
-    tools: config.expected.tools,
-    handlers: config.expected.handlers,
+    errors: result.errors,
+    commands: [...config.expected.commands],
+    tools: [...config.expected.tools],
+    handlers: [...config.expected.handlers],
   };
 };
 
-const isStandardDocument = (path) =>
-  !path.includes("/") && /^(?:README|LICENSE|LICENCE|NOTICE)(?:\..+)?$/i.test(path);
+const secretLike = (path) =>
+  /(^|\/)(?:\.env(?:\.|$)|\.dev\.vars$|\.npmrc$|id_[^/]+$|[^/]+\.(?:pem|key|p12|pfx)$|credentials?(?:\.[^/]*)?$)/i.test(
+    path,
+  );
 
-const verifyPackage = async () => {
-  const temporary = mkdtempSync(join(tmpdir(), "pi-loop-package-"));
-  try {
-    const archive = join(temporary, "extension.tgz");
-    const extracted = join(temporary, "extracted");
-    run("pnpm", ["--config.ignore-scripts=true", "pack", "--out", archive]);
-    mkdirSync(extracted, { recursive: true });
-    await extractArchive({ file: archive, cwd: extracted });
-    const packageRoot = join(extracted, "package");
-    const contract = readDistributionContract(packageRoot);
-    const imports = verifyBundle(contract);
-    const files = listFiles(packageRoot);
-    const unexpected = files.filter(
-      (path) =>
-        path !== "package.json" && path !== contract.entryRelative && !isStandardDocument(path),
+const runTarFile = (operation, options) =>
+  new Promise((resolvePromise, rejectPromise) => {
+    operation({ ...options, sync: false }, (error) => {
+      if (error) rejectPromise(error);
+      else resolvePromise();
+    }).catch(rejectPromise);
+  });
+
+const inspectArchiveEntries = async (archive) => {
+  const entries = [];
+  await runTarFile(listArchive, {
+    file: archive,
+    onentry: (entry) => entries.push({ path: entry.path, mode: entry.mode }),
+  });
+  assert.ok(entries.length > 0, "archive must not be empty");
+  for (const entry of entries) {
+    assert.equal(entry.path.includes("\\"), false, `archive path must use /: ${entry.path}`);
+    assert.equal(entry.path.startsWith("/"), false, `archive path must be relative: ${entry.path}`);
+    assert.equal(
+      entry.path.split("/").includes(".."),
+      false,
+      `archive path must not traverse: ${entry.path}`,
     );
-    assert.deepEqual(unexpected, [], `tarball contains undeclared files: ${unexpected.join(", ")}`);
-    assert.equal(existsSync(join(packageRoot, "node_modules")), false);
-    assert.equal(existsSync(join(packageRoot, "src")), false);
-    const loader = await verifyWithPiLoader(packageRoot);
-    const requestedArchive = process.env.PI_PACKAGE_ARCHIVE;
-    const exportedArchive = requestedArchive ? resolve(projectRoot, requestedArchive) : undefined;
-    if (exportedArchive) {
-      mkdirSync(dirname(exportedArchive), { recursive: true });
-      copyFileSync(archive, exportedArchive);
-    }
+    assert.ok(
+      entry.path === "package" || entry.path.startsWith("package/"),
+      `archive entry must be under package/: ${entry.path}`,
+    );
+    const packagePath = entry.path.replace(/^package\/?/, "").replace(/\/$/, "");
+    if (packagePath)
+      assert.equal(
+        secretLike(packagePath),
+        false,
+        `archive contains secret-like file: ${packagePath}`,
+      );
+  }
+  return entries;
+};
+
+const verifyRawPackage = async (archive) => {
+  const nodeModules = resolve(projectRoot, "node_modules");
+  assert.ok(
+    existsSync(nodeModules),
+    "install the repository test harness before archive verification",
+  );
+  const temporary = mkdtempSync(join(nodeModules, ".pi-extension-archive-"));
+  try {
+    const extracted = resolve(temporary, "raw");
+    mkdirSync(extracted, { recursive: true });
+    const archiveEntries = await inspectArchiveEntries(archive);
+    await runTarFile(extractArchive, { file: archive, cwd: extracted });
+    const packageRoot = resolve(extracted, "package");
+    const contract = readDistributionContract(packageRoot);
+    const remainingImports = verifyBundle(contract);
+    const assets = verifyAssets(contract);
+    const packageFiles = listFiles(packageRoot);
+    const unexpected = packageFiles.filter((path) => {
+      if (path === "package.json" || isStandardDocument(path)) return false;
+      return !contract.publishedRoots.some((root) => path === root || path.startsWith(`${root}/`));
+    });
+    assert.deepEqual(unexpected, [], `archive contains undeclared files: ${unexpected.join(", ")}`);
+    assert.deepEqual(packageFiles.filter(secretLike), [], "archive contains secret-like files");
+    assert.equal(
+      existsSync(resolve(packageRoot, "node_modules")),
+      false,
+      "archive must not contain node_modules",
+    );
+    assert.equal(existsSync(resolve(packageRoot, "src")), false, "archive must not contain src");
+    const loader = await verifyWithPiLoader(packageRoot, temporary);
     return {
-      entry: contract.entryRelative,
-      bundleBytes: statSync(contract.entryAbsolute).size,
-      remainingImports: imports,
-      packageFiles: files,
-      loader,
-      ...(exportedArchive
-        ? { exportedArchive: relative(projectRoot, exportedArchive).split(sep).join("/") }
-        : {}),
+      temporary,
+      packageRoot,
+      facts: {
+        profile: contract.profile,
+        entry: contract.entryRelative,
+        bundleBytes: statSync(contract.entryAbsolute).size,
+        assets,
+        remainingImports,
+        packageFiles,
+        archiveEntries: archiveEntries.length,
+        loader,
+      },
     };
-  } finally {
+  } catch (error) {
     rmSync(temporary, { recursive: true, force: true });
+    throw error;
   }
 };
 
-const verifyArchive = async (archiveInput) => {
+const archiveIntegrity = (archive) =>
+  `sha512-${createHash("sha512").update(readFileSync(archive)).digest("base64")}`;
+
+const verifyArchive = async (archiveInput, invokeDomain) => {
   const archive = resolve(projectRoot, archiveInput);
   assert.ok(existsSync(archive), `missing archive: ${archive}`);
-  const temporary = mkdtempSync(join(tmpdir(), "pi-loop-archive-"));
+  const raw = await verifyRawPackage(archive);
+  let domainCheck = null;
   try {
-    const extracted = join(temporary, "archive");
-    mkdirSync(extracted, { recursive: true });
-    await extractArchive({ file: archive, cwd: extracted });
-    const archiveContract = readDistributionContract(join(extracted, "package"));
-    run(
-      "npm",
-      [
-        "install",
-        archive,
-        "--prefix",
-        temporary,
-        "--ignore-scripts=false",
-        "--no-audit",
-        "--no-fund",
-      ],
-      projectRoot,
-    );
-    const packageRoot = join(
-      temporary,
-      "node_modules",
-      ...archiveContract.manifest.name.split("/"),
-    );
-    const contract = readDistributionContract(packageRoot);
-    const imports = verifyBundle(contract);
-    const loader = await verifyWithPiLoader(packageRoot);
-    return {
-      entry: contract.entryRelative,
-      bundleBytes: statSync(contract.entryAbsolute).size,
-      remainingImports: imports,
-      packageFiles: listFiles(packageRoot),
-      loader,
-    };
+    if (invokeDomain && typeof projectManifest.scripts?.["pi:domain-check"] === "string") {
+      run(packageManager, ["run", "pi:domain-check", "--", raw.packageRoot], {
+        env: {
+          ...process.env,
+          PI_EXTENSION_ARCHIVE: archive,
+          PI_EXTENSION_PACKAGE_ROOT: raw.packageRoot,
+        },
+      });
+      domainCheck = "pi:domain-check";
+    }
+    return { ...raw.facts, integrity: archiveIntegrity(archive), domainCheck };
   } finally {
+    rmSync(raw.temporary, { recursive: true, force: true });
+  }
+};
+
+const packCurrentOutput = () => {
+  const temporary = mkdtempSync(join(resolve(projectRoot, "node_modules"), ".pi-extension-pack-"));
+  try {
+    run("npm", ["pack", "--ignore-scripts", "--pack-destination", temporary]);
+    const archives = readdirSync(temporary).filter((file) => file.endsWith(".tgz"));
+    assert.equal(archives.length, 1, `expected one archive, found ${archives.length}`);
+    return { temporary, archive: resolve(temporary, archives[0]) };
+  } catch (error) {
     rmSync(temporary, { recursive: true, force: true });
+    throw error;
   }
 };
 
 const mode = process.argv[2];
 assert.ok(
-  mode === "bundle" || mode === "package" || mode === "archive",
-  "usage: verify-distribution.mjs bundle|package|archive <path>",
+  new Set(["bundle", "package", "archive", "public"]).has(mode),
+  "usage: verify-distribution.mjs bundle|package|archive <path>|public <path>",
 );
+
 let result;
-if (mode === "archive") {
+if (mode === "bundle") {
+  const contract = readDistributionContract();
+  result = {
+    profile: contract.profile,
+    entry: contract.entryRelative,
+    bundleBytes: statSync(contract.entryAbsolute).size,
+    assets: verifyAssets(contract),
+    remainingImports: verifyBundle(contract),
+  };
+} else if (mode === "package") {
+  const packed = packCurrentOutput();
+  try {
+    result = await verifyArchive(packed.archive, false);
+  } finally {
+    rmSync(packed.temporary, { recursive: true, force: true });
+  }
+} else {
   const rawArguments = process.argv.slice(3);
   const archiveArguments = rawArguments[0] === "--" ? rawArguments.slice(1) : rawArguments;
-  assert.equal(archiveArguments.length, 1, "archive mode requires exactly one archive path");
-  const archive = archiveArguments[0];
-  assert.ok(archive);
-  result = await verifyArchive(archive);
-} else {
-  const contract = readDistributionContract();
-  const imports = verifyBundle(contract);
-  result =
-    mode === "package"
-      ? await verifyPackage()
-      : {
-          entry: contract.entryRelative,
-          bundleBytes: statSync(contract.entryAbsolute).size,
-          remainingImports: imports,
-        };
+  assert.equal(archiveArguments.length, 1, `${mode} mode requires exactly one archive path`);
+  result = await verifyArchive(archiveArguments[0], mode === "archive");
 }
+
 process.stdout.write(`${JSON.stringify({ selfContained: true, ...result }, null, 2)}\n`);

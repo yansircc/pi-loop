@@ -1,11 +1,13 @@
 export default Object.freeze({
   source: "src/pi/extension.ts",
-  target: "node22",
-  hostModules: ["@earendil-works/pi-coding-agent"],
-  loaderModule: "@earendil-works/pi-coding-agent",
+  hostModules: Object.freeze(["@earendil-works/pi-coding-agent"]),
+  profile: Object.freeze({
+    kind: "single-file",
+    assets: Object.freeze([]),
+  }),
   expected: Object.freeze({
-    commands: ["loop", "loop-control", "loop-kill", "loop-list"],
-    tools: ["cron_create", "cron_delete", "cron_list", "schedule_wakeup"],
-    handlers: ["agent_end", "agent_start", "session_shutdown", "session_start"],
+    commands: Object.freeze(["loop", "loop-control", "loop-kill", "loop-list"]),
+    tools: Object.freeze(["cron_create", "cron_delete", "cron_list", "schedule_wakeup"]),
+    handlers: Object.freeze(["agent_end", "agent_start", "session_shutdown", "session_start"]),
   }),
 });

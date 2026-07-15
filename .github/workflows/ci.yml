@@ -158,7 +158,8 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: |
+          pnpm install --frozen-lockfile
 
       - name: Download verified archive
         uses: actions/download-artifact@v8
@@ -166,14 +167,14 @@ jobs:
           name: npm-package-${{ github.sha }}
           path: release
 
-      - name: Install and load the verified archive
-        run: pnpm run pi:archive-check -- release/package.tgz
-
+      - name: Verify exact release archive
+        run: pnpm run release:archive-check -- release/package.tgz
   commit_release:
     name: Commit and tag release
     needs:
       - release
       - verify_archive
+
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -259,6 +260,7 @@ jobs:
     needs:
       - release
       - verify_archive
+
       - commit_release
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -328,34 +330,56 @@ jobs:
       - release
       - publish
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     permissions:
       contents: read
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 24.11.0
+          cache: pnpm
           registry-url: https://registry.npmjs.org
 
-      - name: Verify public installation
+      - name: Install dependencies
+        run: |
+          pnpm install --frozen-lockfile
+
+      - name: Download verified archive
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-package-${{ github.sha }}
+          path: release
+
+      - name: Verify registry integrity and public installation
         shell: bash
         env:
           NPM_CONFIG_USERCONFIG: /dev/null
           PACKAGE_SPEC: ${{ needs.release.outputs.name }}@${{ needs.release.outputs.version }}
         run: |
-          visible=false
+          local_integrity="sha512-$(openssl dgst -sha512 -binary ./release/package.tgz | openssl base64 -A)"
+          remote_integrity=""
           for attempt in {1..60}; do
-            if npm view "${PACKAGE_SPEC}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
-              visible=true
+            if remote_json="$(npm view "${PACKAGE_SPEC}" dist.integrity --json --registry=https://registry.npmjs.org/ 2>/dev/null)"; then
+              remote_integrity="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]))' "${remote_json}")"
               break
             fi
             sleep 5
           done
-          if [[ "${visible}" != true ]]; then
+          if [[ -z "${remote_integrity}" ]]; then
             echo "${PACKAGE_SPEC} did not become publicly visible." >&2
+            exit 1
+          fi
+          if [[ "${remote_integrity}" != "${local_integrity}" ]]; then
+            echo "Public ${PACKAGE_SPEC} does not match the verified archive." >&2
             exit 1
           fi
           install_root="$(mktemp -d)"
@@ -366,45 +390,19 @@ jobs:
             --no-audit \
             --no-fund
 
-          package_name="$(npm view "${PACKAGE_SPEC}" name --json --registry=https://registry.npmjs.org/ | node -e '
-            let input = "";
-            process.stdin.setEncoding("utf8");
-            process.stdin.on("data", (chunk) => { input += chunk; });
-            process.stdin.on("end", () => { process.stdout.write(JSON.parse(input)); });
-          ')"
-          package_root="${install_root}/node_modules/${package_name}"
-          host_version="$(node -e 'process.stdout.write(require(process.argv[1]).devDependencies["@earendil-works/pi-coding-agent"])' "${package_root}/package.json")"
-          npm install "@earendil-works/pi-coding-agent@${host_version}" \
-            --prefix "${install_root}" \
-            --ignore-scripts=false \
-            --no-audit \
-            --no-fund
+      - name: Fetch public archive
+        shell: bash
+        env:
+          PACKAGE_SPEC: ${{ needs.release.outputs.name }}@${{ needs.release.outputs.version }}
+        run: |
+          mkdir -p public-release
+          npm pack "${PACKAGE_SPEC}" --pack-destination public-release
+          mapfile -t archives < <(find public-release -maxdepth 1 -type f -name '*.tgz')
+          if [[ "${#archives[@]}" -ne 1 ]]; then
+            echo "Expected one public npm archive, found ${#archives[@]}." >&2
+            exit 1
+          fi
+          mv "${archives[0]}" public-release/package.tgz
 
-          agent_root="$(mktemp -d)"
-          trap 'rm -rf "${install_root}" "${agent_root}"' EXIT
-          PACKAGE_ROOT="${package_root}" AGENT_ROOT="${agent_root}" INSTALL_ROOT="${install_root}" \
-            node --input-type=module <<'NODE'
-          import assert from "node:assert/strict";
-          import { pathToFileURL } from "node:url";
-
-          const host = await import(
-            pathToFileURL(`${process.env.INSTALL_ROOT}/node_modules/@earendil-works/pi-coding-agent/dist/index.js`)
-          );
-          const result = await host.discoverAndLoadExtensions(
-            [process.env.PACKAGE_ROOT],
-            process.env.INSTALL_ROOT,
-            process.env.AGENT_ROOT,
-          );
-          assert.deepEqual(result.errors, []);
-          assert.equal(result.extensions.length, 1);
-          const extension = result.extensions[0];
-          for (const name of ["loop", "loop-control", "loop-kill", "loop-list"]) {
-            assert.ok(extension.commands.has(name), `missing /${name}`);
-          }
-          for (const name of ["cron_create", "cron_delete", "cron_list", "schedule_wakeup"]) {
-            assert.ok(extension.tools.has(name), `missing ${name}`);
-          }
-          for (const name of ["agent_end", "agent_start", "session_shutdown", "session_start"]) {
-            assert.ok(extension.handlers.has(name), `missing ${name}`);
-          }
-          NODE
+      - name: Verify public archive
+        run: pnpm run release:public-check -- public-release/package.tgz

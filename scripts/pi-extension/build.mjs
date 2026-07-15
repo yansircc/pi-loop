@@ -10,7 +10,7 @@ await build({
   ssr: { noExternal: true },
   build: {
     ssr: config.source,
-    target: config.target,
+    target: "node22",
     outDir: contract.outputDirectory,
     emptyOutDir: true,
     minify: false,

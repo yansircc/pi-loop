@@ -27,14 +27,16 @@
   },
   "scripts": {
     "effect:prepare": "node scripts/prepare-effect-tsgo.mjs",
-    "verify": "pnpm run effect:prepare && vp run quality",
+    "verify": "pnpm run effect:prepare && pnpm run repo:quality && pnpm run pi:verify",
+    "repo:quality": "vp run quality",
     "test": "vp test",
     "pi:build": "node scripts/pi-extension/build.mjs",
     "pi:bundle-check": "node scripts/pi-extension/verify-distribution.mjs bundle",
     "pi:distribution-check": "node scripts/pi-extension/verify-distribution.mjs package",
-    "pi:archive-check": "node scripts/pi-extension/verify-distribution.mjs archive",
     "pi:verify": "pnpm run pi:build && pnpm run pi:distribution-check",
-    "pi:pack": "pnpm run pi:verify && pnpm --config.ignore-scripts=true pack --out yansircc-pi-loop-%v.tgz"
+    "pi:domain-check": "node scripts/domain/verify-extension.mjs",
+    "release:archive-check": "node scripts/pi-extension/verify-distribution.mjs archive",
+    "release:public-check": "node scripts/pi-extension/verify-distribution.mjs public"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.80.6",
