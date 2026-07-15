@@ -1,6 +1,6 @@
 {
   "name": "@yansircc/pi-loop",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "Effect-based temporal loops for Pi",
   "keywords": [
     "cron",
