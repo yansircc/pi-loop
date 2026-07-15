@@ -41,6 +41,20 @@ if (existingCommit) {
 
 const manifestPath = resolve(root, "package.json");
 const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+if (mode === "new") {
+  const previousRelease = git(
+    ["log", "origin/main", "--format=%H", "--grep=^Release-Source: ", "-n", "1"],
+    { quiet: true },
+  );
+  if (previousRelease) {
+    const releasedManifest = JSON.parse(git(["show", `${previousRelease}:package.json`]));
+    if (manifest.version !== releasedManifest.version) {
+      throw new Error(
+        `package version is CI-owned; expected ${releasedManifest.version}, received ${manifest.version}`,
+      );
+    }
+  }
+}
 const version = mode === "new" ? bumpVersion(manifest.version, bump) : manifest.version;
 if (mode === "new") {
   manifest.version = version;
