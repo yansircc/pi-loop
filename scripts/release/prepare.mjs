@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { bumpVersion, releaseBumpFromMessage } from "./version.mjs";
 
@@ -13,6 +13,8 @@ const git = (args, options = {}) =>
     encoding: "utf8",
     stdio: options.quiet ? ["ignore", "pipe", "ignore"] : ["ignore", "pipe", "inherit"],
   }).trim();
+
+const writeJson = (path, value) => writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 
 git(["cat-file", "-e", `${sourceSha}^{commit}`]);
 const existingCommit = git(
@@ -28,16 +30,10 @@ const existingCommit = git(
   { quiet: true },
 );
 
-let mode;
-let bump;
-if (existingCommit) {
-  mode = "existing";
-  git(["checkout", "--detach", existingCommit]);
-  bump = releaseBumpFromMessage(git(["show", "-s", "--format=%B", existingCommit]));
-} else {
-  mode = "new";
-  bump = releaseBumpFromMessage(git(["show", "-s", "--format=%B", sourceSha]));
-}
+const mode = existingCommit ? "existing" : "new";
+if (existingCommit) git(["checkout", "--detach", existingCommit]);
+const messageCommit = existingCommit || sourceSha;
+const bump = releaseBumpFromMessage(git(["show", "-s", "--format=%B", messageCommit]));
 
 const manifestPath = resolve(root, "package.json");
 const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -55,10 +51,21 @@ if (mode === "new") {
     }
   }
 }
+
 const version = mode === "new" ? bumpVersion(manifest.version, bump) : manifest.version;
+const releaseFiles = ["package.json"];
 if (mode === "new") {
   manifest.version = version;
-  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  writeJson(manifestPath, manifest);
+  for (const filename of ["package-lock.json", "npm-shrinkwrap.json"]) {
+    const path = resolve(root, filename);
+    if (!existsSync(path)) continue;
+    const lock = JSON.parse(readFileSync(path, "utf8"));
+    lock.version = version;
+    if (lock.packages?.[""]) lock.packages[""].version = version;
+    writeJson(path, lock);
+    releaseFiles.push(filename);
+  }
 }
 
 const tag = `v${version}`;
@@ -79,12 +86,12 @@ const result = {
   version,
   tag,
   sourceSha,
+  releaseFiles: releaseFiles.join(","),
   existingCommit: existingCommit || undefined,
 };
-const githubOutput = process.env.GITHUB_OUTPUT;
-if (githubOutput) {
+if (process.env.GITHUB_OUTPUT) {
   appendFileSync(
-    githubOutput,
+    process.env.GITHUB_OUTPUT,
     Object.entries(result)
       .filter(([, value]) => value !== undefined)
       .map(([key, value]) => `${key}=${value}`)

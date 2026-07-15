@@ -11,14 +11,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'release-main' || format('{0}-{1}', github.workflow, github.ref) }}
-  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]' && 'release-main' || format('{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]') }}
 
 jobs:
   verify:
-    name: Verify
-    if: github.event_name != 'push' || github.ref != 'refs/heads/main'
-    runs-on: ubuntu-latest
+    name: Verify (${{ matrix.os }})
+    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
 
     steps:
@@ -35,24 +42,31 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: |
+          pnpm install --frozen-lockfile
 
       - name: Verify package
-        run: pnpm run verify
+        run: |
+          pnpm run verify
 
   release:
     name: Prepare release
+    needs: verify
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     permissions:
-      contents: write
+      contents: read
 
     outputs:
       name: ${{ steps.release.outputs.name }}
       version: ${{ steps.release.outputs.version }}
       tag: ${{ steps.release.outputs.tag }}
+      mode: ${{ steps.release.outputs.mode }}
+      bump: ${{ steps.release.outputs.bump }}
+      source_sha: ${{ steps.release.outputs.sourceSha }}
+      release_files: ${{ steps.release.outputs.releaseFiles }}
 
     steps:
       - name: Check out repository
@@ -68,47 +82,43 @@ jobs:
         with:
           node-version: 24.11.0
           cache: pnpm
+          registry-url: https://registry.npmjs.org
 
       - name: Synchronize release branch
         run: |
           git fetch origin main --tags
-          git checkout -B main origin/main
+          git checkout --detach "${GITHUB_SHA}"
 
       - name: Prepare release version
         id: release
         run: node scripts/release/prepare.mjs "${GITHUB_SHA}"
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Verify release archive
-        env:
-          PI_PACKAGE_ARCHIVE: release/package.tgz
-        run: pnpm run verify
-
-      - name: Commit and tag release
-        if: steps.release.outputs.mode == 'new'
-        shell: bash
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
-          TAG: ${{ steps.release.outputs.tag }}
-          BUMP: ${{ steps.release.outputs.bump }}
-          SOURCE_SHA: ${{ steps.release.outputs.sourceSha }}
         run: |
-          changed="$(git diff --name-only)"
-          if [[ "${changed}" != "package.json" ]]; then
-            echo "Release preparation changed unexpected files: ${changed}" >&2
+          pnpm install --frozen-lockfile
+
+      - name: Verify package
+        run: |
+          pnpm run verify
+
+      - name: Pack and install the verified archive
+        shell: bash
+        run: |
+          mkdir -p release
+          npm pack --pack-destination release
+          mapfile -t archives < <(find release -maxdepth 1 -type f -name '*.tgz')
+          if [[ "${#archives[@]}" -ne 1 ]]; then
+            echo "Expected one npm archive, found ${#archives[@]}." >&2
             exit 1
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add package.json
-          git commit \
-            -m "chore(release): v${VERSION}" \
-            -m "Release-Source: ${SOURCE_SHA}" \
-            -m "Release-Bump: ${BUMP}"
-          git tag -a "${TAG}" -m "${TAG}"
-          git push --atomic origin HEAD:main "refs/tags/${TAG}"
+          mv "${archives[0]}" release/package.tgz
+          install_root="$(mktemp -d)"
+          trap 'rm -rf "${install_root}"' EXIT
+          npm install ./release/package.tgz \
+            --prefix "${install_root}" \
+            --ignore-scripts=false \
+            --no-audit \
+            --no-fund
 
       - name: Upload verified archive
         uses: actions/upload-artifact@v7
@@ -118,9 +128,138 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  verify_archive:
+    name: Verify release archive (${{ matrix.os }})
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.11.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download verified archive
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-package-${{ github.sha }}
+          path: release
+
+      - name: Install and load the verified archive
+        run: pnpm run pi:archive-check -- release/package.tgz
+
+  commit_release:
+    name: Commit and tag release
+    needs:
+      - release
+      - verify_archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.11.0
+
+      - name: Reproduce release version
+        id: release
+        env:
+          SOURCE_SHA: ${{ needs.release.outputs.source_sha }}
+        run: |
+          git fetch origin main --tags
+          git checkout --detach "${SOURCE_SHA}"
+          node scripts/release/prepare.mjs "${SOURCE_SHA}"
+
+      - name: Require the reproduced release identity
+        shell: bash
+        env:
+          ACTUAL_NAME: ${{ steps.release.outputs.name }}
+          ACTUAL_VERSION: ${{ steps.release.outputs.version }}
+          ACTUAL_TAG: ${{ steps.release.outputs.tag }}
+          ACTUAL_MODE: ${{ steps.release.outputs.mode }}
+          ACTUAL_BUMP: ${{ steps.release.outputs.bump }}
+          ACTUAL_SOURCE_SHA: ${{ steps.release.outputs.sourceSha }}
+          ACTUAL_RELEASE_FILES: ${{ steps.release.outputs.releaseFiles }}
+          EXPECTED_NAME: ${{ needs.release.outputs.name }}
+          EXPECTED_VERSION: ${{ needs.release.outputs.version }}
+          EXPECTED_TAG: ${{ needs.release.outputs.tag }}
+          EXPECTED_MODE: ${{ needs.release.outputs.mode }}
+          EXPECTED_BUMP: ${{ needs.release.outputs.bump }}
+          EXPECTED_SOURCE_SHA: ${{ needs.release.outputs.source_sha }}
+          EXPECTED_RELEASE_FILES: ${{ needs.release.outputs.release_files }}
+        run: |
+          test "${ACTUAL_NAME}" = "${EXPECTED_NAME}"
+          test "${ACTUAL_VERSION}" = "${EXPECTED_VERSION}"
+          test "${ACTUAL_TAG}" = "${EXPECTED_TAG}"
+          test "${ACTUAL_MODE}" = "${EXPECTED_MODE}"
+          test "${ACTUAL_BUMP}" = "${EXPECTED_BUMP}"
+          test "${ACTUAL_SOURCE_SHA}" = "${EXPECTED_SOURCE_SHA}"
+          test "${ACTUAL_RELEASE_FILES}" = "${EXPECTED_RELEASE_FILES}"
+
+      - name: Commit and tag release
+        if: steps.release.outputs.mode == 'new'
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+          BUMP: ${{ steps.release.outputs.bump }}
+          SOURCE_SHA: ${{ steps.release.outputs.sourceSha }}
+          RELEASE_FILES: ${{ steps.release.outputs.releaseFiles }}
+        run: |
+          IFS=, read -r -a release_files <<< "${RELEASE_FILES}"
+          actual="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' "${release_files[@]}" | sort)"
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "Release preparation changed unexpected files." >&2
+            diff -u <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}") || true
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "${release_files[@]}"
+          git commit \
+            -m "chore(release): v${VERSION}" \
+            -m "Release-Source: ${SOURCE_SHA}" \
+            -m "Release-Bump: ${BUMP}"
+          git tag -a "${TAG}" -m "${TAG}"
+          git push --atomic origin HEAD:main "refs/tags/${TAG}"
+
   publish:
     name: Publish npm package
-    needs: release
+    needs:
+      - release
+      - verify_archive
+      - commit_release
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -150,7 +289,6 @@ jobs:
           trap 'rm -rf "${install_root}" "${view_error}"' EXIT
           npm install "${archive}" \
             --prefix "${install_root}" \
-            --legacy-peer-deps \
             --ignore-scripts=false \
             --no-audit \
             --no-fund
@@ -196,20 +334,11 @@ jobs:
       contents: read
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v6
-
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 24.11.0
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+          registry-url: https://registry.npmjs.org
 
       - name: Verify public installation
         shell: bash
@@ -229,8 +358,53 @@ jobs:
             echo "${PACKAGE_SPEC} did not become publicly visible." >&2
             exit 1
           fi
+          install_root="$(mktemp -d)"
+          trap 'rm -rf "${install_root}"' EXIT
+          npm install "${PACKAGE_SPEC}" \
+            --prefix "${install_root}" \
+            --ignore-scripts=false \
+            --no-audit \
+            --no-fund
 
-          temp_pi="$(mktemp -d)"
-          trap 'rm -rf "${temp_pi}"' EXIT
-          PI_CODING_AGENT_DIR="${temp_pi}" pnpm exec pi install "npm:${PACKAGE_SPEC}"
-          PI_CODING_AGENT_DIR="${temp_pi}" pnpm exec pi list
+          package_name="$(npm view "${PACKAGE_SPEC}" name --json --registry=https://registry.npmjs.org/ | node -e '
+            let input = "";
+            process.stdin.setEncoding("utf8");
+            process.stdin.on("data", (chunk) => { input += chunk; });
+            process.stdin.on("end", () => { process.stdout.write(JSON.parse(input)); });
+          ')"
+          package_root="${install_root}/node_modules/${package_name}"
+          host_version="$(node -e 'process.stdout.write(require(process.argv[1]).devDependencies["@earendil-works/pi-coding-agent"])' "${package_root}/package.json")"
+          npm install "@earendil-works/pi-coding-agent@${host_version}" \
+            --prefix "${install_root}" \
+            --ignore-scripts=false \
+            --no-audit \
+            --no-fund
+
+          agent_root="$(mktemp -d)"
+          trap 'rm -rf "${install_root}" "${agent_root}"' EXIT
+          PACKAGE_ROOT="${package_root}" AGENT_ROOT="${agent_root}" INSTALL_ROOT="${install_root}" \
+            node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { pathToFileURL } from "node:url";
+
+          const host = await import(
+            pathToFileURL(`${process.env.INSTALL_ROOT}/node_modules/@earendil-works/pi-coding-agent/dist/index.js`)
+          );
+          const result = await host.discoverAndLoadExtensions(
+            [process.env.PACKAGE_ROOT],
+            process.env.INSTALL_ROOT,
+            process.env.AGENT_ROOT,
+          );
+          assert.deepEqual(result.errors, []);
+          assert.equal(result.extensions.length, 1);
+          const extension = result.extensions[0];
+          for (const name of ["loop", "loop-control", "loop-kill", "loop-list"]) {
+            assert.ok(extension.commands.has(name), `missing /${name}`);
+          }
+          for (const name of ["cron_create", "cron_delete", "cron_list", "schedule_wakeup"]) {
+            assert.ok(extension.tools.has(name), `missing ${name}`);
+          }
+          for (const name of ["agent_end", "agent_start", "session_shutdown", "session_start"]) {
+            assert.ok(extension.handlers.has(name), `missing ${name}`);
+          }
+          NODE

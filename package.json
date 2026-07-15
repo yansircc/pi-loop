@@ -32,6 +32,7 @@
     "pi:build": "node scripts/pi-extension/build.mjs",
     "pi:bundle-check": "node scripts/pi-extension/verify-distribution.mjs bundle",
     "pi:distribution-check": "node scripts/pi-extension/verify-distribution.mjs package",
+    "pi:archive-check": "node scripts/pi-extension/verify-distribution.mjs archive",
     "pi:verify": "pnpm run pi:build && pnpm run pi:distribution-check",
     "pi:pack": "pnpm run pi:verify && pnpm --config.ignore-scripts=true pack --out yansircc-pi-loop-%v.tgz"
   },
@@ -44,7 +45,9 @@
     "@types/node": "22.20.1",
     "@yansircc/effect-scan": "0.1.2",
     "acorn": "8.15.0",
+    "cross-spawn": "7.0.6",
     "effect": "4.0.0-beta.97",
+    "tar": "7.5.20",
     "typescript": "7.0.2",
     "vite": "npm:@voidzero-dev/vite-plus-core@0.2.4",
     "vite-plus": "0.2.4",

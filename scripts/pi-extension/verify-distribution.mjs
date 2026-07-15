@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
@@ -13,12 +12,27 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { parse } from "acorn";
+import crossSpawn from "cross-spawn";
+import { x as extractArchive } from "tar";
 import config from "./config.mjs";
 import {
   isAllowedExternal,
   projectRoot,
   readDistributionContract,
 } from "./distribution-contract.mjs";
+
+const run = (command, args, cwd = projectRoot) => {
+  const result = crossSpawn.sync(command, args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) {
+    process.stderr.write(result.stdout ?? "");
+    process.stderr.write(result.stderr ?? "");
+    throw new Error(`${command} ${args.join(" ")} failed with exit ${result.status}`);
+  }
+};
 
 const listFiles = (root) => {
   const files = [];
@@ -115,12 +129,9 @@ const verifyPackage = async () => {
   try {
     const archive = join(temporary, "extension.tgz");
     const extracted = join(temporary, "extracted");
-    execFileSync("pnpm", ["--config.ignore-scripts=true", "pack", "--out", archive], {
-      cwd: projectRoot,
-      stdio: "pipe",
-    });
+    run("pnpm", ["--config.ignore-scripts=true", "pack", "--out", archive]);
     mkdirSync(extracted, { recursive: true });
-    execFileSync("tar", ["-xzf", archive, "-C", extracted]);
+    await extractArchive({ file: archive, cwd: extracted });
     const packageRoot = join(extracted, "package");
     const contract = readDistributionContract(packageRoot);
     const imports = verifyBundle(contract);
@@ -154,16 +165,71 @@ const verifyPackage = async () => {
   }
 };
 
+const verifyArchive = async (archiveInput) => {
+  const archive = resolve(projectRoot, archiveInput);
+  assert.ok(existsSync(archive), `missing archive: ${archive}`);
+  const temporary = mkdtempSync(join(tmpdir(), "pi-loop-archive-"));
+  try {
+    const extracted = join(temporary, "archive");
+    mkdirSync(extracted, { recursive: true });
+    await extractArchive({ file: archive, cwd: extracted });
+    const archiveContract = readDistributionContract(join(extracted, "package"));
+    run(
+      "npm",
+      [
+        "install",
+        archive,
+        "--prefix",
+        temporary,
+        "--ignore-scripts=false",
+        "--no-audit",
+        "--no-fund",
+      ],
+      projectRoot,
+    );
+    const packageRoot = join(
+      temporary,
+      "node_modules",
+      ...archiveContract.manifest.name.split("/"),
+    );
+    const contract = readDistributionContract(packageRoot);
+    const imports = verifyBundle(contract);
+    const loader = await verifyWithPiLoader(packageRoot);
+    return {
+      entry: contract.entryRelative,
+      bundleBytes: statSync(contract.entryAbsolute).size,
+      remainingImports: imports,
+      packageFiles: listFiles(packageRoot),
+      loader,
+    };
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+};
+
 const mode = process.argv[2];
-assert.ok(mode === "bundle" || mode === "package", "usage: verify-distribution.mjs bundle|package");
-const contract = readDistributionContract();
-const imports = verifyBundle(contract);
-const result =
-  mode === "package"
-    ? await verifyPackage()
-    : {
-        entry: contract.entryRelative,
-        bundleBytes: statSync(contract.entryAbsolute).size,
-        remainingImports: imports,
-      };
+assert.ok(
+  mode === "bundle" || mode === "package" || mode === "archive",
+  "usage: verify-distribution.mjs bundle|package|archive <path>",
+);
+let result;
+if (mode === "archive") {
+  const rawArguments = process.argv.slice(3);
+  const archiveArguments = rawArguments[0] === "--" ? rawArguments.slice(1) : rawArguments;
+  assert.equal(archiveArguments.length, 1, "archive mode requires exactly one archive path");
+  const archive = archiveArguments[0];
+  assert.ok(archive);
+  result = await verifyArchive(archive);
+} else {
+  const contract = readDistributionContract();
+  const imports = verifyBundle(contract);
+  result =
+    mode === "package"
+      ? await verifyPackage()
+      : {
+          entry: contract.entryRelative,
+          bundleBytes: statSync(contract.entryAbsolute).size,
+          remainingImports: imports,
+        };
+}
 process.stdout.write(`${JSON.stringify({ selfContained: true, ...result }, null, 2)}\n`);
