@@ -1,0 +1,50 @@
+{
+  "name": "@pi-agents/loop",
+  "version": "0.4.0",
+  "description": "Effect-based temporal loops for Pi",
+  "license": "MIT",
+  "files": [
+    "dist/pi"
+  ],
+  "type": "module",
+  "scripts": {
+    "postinstall": "node scripts/prepare-effect-tsgo.mjs",
+    "test": "vp test",
+    "pi:build": "node scripts/pi-extension/build.mjs",
+    "pi:bundle-check": "node scripts/pi-extension/verify-distribution.mjs bundle",
+    "pi:distribution-check": "node scripts/pi-extension/verify-distribution.mjs package",
+    "pi:verify": "pnpm run pi:build && pnpm run pi:distribution-check",
+    "pi:pack": "pnpm run pi:verify && pnpm --config.ignore-scripts=true pack --out pi-agents-loop-%v.tgz"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@effect/platform-node": "4.0.0-beta.97",
+    "@effect/tsgo": "0.21.0",
+    "@effect/vitest": "4.0.0-beta.97",
+    "@sinclair/typebox": "0.34.41",
+    "@types/node": "22.20.1",
+    "acorn": "8.15.0",
+    "effect": "4.0.0-beta.97",
+    "typescript": "7.0.2",
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.2.4",
+    "vite-plus": "0.2.4",
+    "vitest": "4.1.10"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.6"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.11.0"
+  },
+  "packageManager": "pnpm@10.11.0",
+  "pi": {
+    "extensions": [
+      "./dist/pi/extension.js"
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "shape": ["library"],
+  "executableEdges": [],
+  "allowedAdapters": [],
+  "hostTooling": [
+    {
+      "path": "scripts/**",
+      "owner": "@build-tooling",
+      "reason": "Node build, package, and zero-install loader verification"
+    }
+  ],
+  "testGlobs": ["test-suite/**/*.test.ts"]
+}

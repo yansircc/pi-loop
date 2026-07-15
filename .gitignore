@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tgz
+.effect-evidence/
+.pi-loop.json
+.pi-loop.json.lock
+/.worktrees/
