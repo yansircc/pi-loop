@@ -1,9 +1,9 @@
-# @pi-agents/loop
+# pi-loop
 
 Effect-based temporal loops for Pi.
 
 ```sh
-pi install npm:@pi-agents/loop
+pi install npm:@yansircc/pi-loop
 ```
 
 ## Commands
@@ -59,7 +59,8 @@ Project overrides belong in `.pi-loop.config.json`:
 
 ```sh
 pnpm install
-vp run verify
+pnpm run effect:prepare
+pnpm run verify
 pnpm run pi:pack
 ```
 

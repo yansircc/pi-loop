@@ -1,20 +1,39 @@
 {
-  "name": "@pi-agents/loop",
+  "name": "@yansircc/pi-loop",
   "version": "0.4.0",
   "description": "Effect-based temporal loops for Pi",
+  "keywords": [
+    "cron",
+    "pi-extension",
+    "pi-package",
+    "scheduler"
+  ],
+  "homepage": "https://github.com/yansircc/pi-loop#readme",
+  "bugs": {
+    "url": "https://github.com/yansircc/pi-loop/issues"
+  },
   "license": "MIT",
+  "author": "Yansir <markyan@foxmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yansircc/pi-loop.git"
+  },
   "files": [
     "dist/pi"
   ],
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "postinstall": "node scripts/prepare-effect-tsgo.mjs",
+    "effect:prepare": "node scripts/prepare-effect-tsgo.mjs",
+    "verify": "vp run quality",
     "test": "vp test",
     "pi:build": "node scripts/pi-extension/build.mjs",
     "pi:bundle-check": "node scripts/pi-extension/verify-distribution.mjs bundle",
     "pi:distribution-check": "node scripts/pi-extension/verify-distribution.mjs package",
     "pi:verify": "pnpm run pi:build && pnpm run pi:distribution-check",
-    "pi:pack": "pnpm run pi:verify && pnpm --config.ignore-scripts=true pack --out pi-agents-loop-%v.tgz"
+    "pi:pack": "pnpm run pi:verify && pnpm --config.ignore-scripts=true pack --out yansircc-pi-loop-%v.tgz"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.80.6",
@@ -31,7 +50,7 @@
     "vitest": "4.1.10"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.80.6"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {

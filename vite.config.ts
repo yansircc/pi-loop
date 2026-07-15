@@ -19,7 +19,7 @@ export default defineConfig({
       },
       "package:artifact": { command: "pnpm run pi:distribution-check", cache: false },
       pack: { command: "pnpm run pi:pack", cache: false },
-      verify: {
+      quality: {
         command: [
           "vp check",
           "vp run typecheck",
