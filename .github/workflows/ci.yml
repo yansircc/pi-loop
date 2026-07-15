@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.11.0
+          cache: pnpm
+
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          package_name="$(node --print "require('./package.json').name")"
+          package_version="$(node --print "require('./package.json').version")"
+          expected_tag="v${package_version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package version ${package_version}." >&2
+            exit 1
+          fi
+          view_error="$(mktemp)"
+          if npm view "${package_name}@${package_version}" version --registry=https://registry.npmjs.org/ >/dev/null 2>"${view_error}"; then
+            echo "${package_name}@${package_version} is already published." >&2
+            exit 1
+          fi
+          if ! grep -q 'E404' "${view_error}"; then
+            cat "${view_error}" >&2
+            echo "Could not prove ${package_name}@${package_version} is unpublished." >&2
+            exit 1
+          fi
+          rm -f "${view_error}"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify package
+        env:
+          PI_PACKAGE_ARCHIVE: release/package.tgz
+        run: pnpm run verify
+
+      - name: Upload release archive
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-package-${{ github.sha }}
+          path: release/package.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish npm package
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.11.0
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download verified archive
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-package-${{ github.sha }}
+          path: release
+
+      - name: Publish verified archive
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          install_root="$(mktemp -d)"
+          trap 'rm -rf "${install_root}"' EXIT
+          npm install ./release/package.tgz \
+            --prefix "${install_root}" \
+            --legacy-peer-deps \
+            --ignore-scripts=false \
+            --no-audit \
+            --no-fund
+          npm publish ./release/package.tgz --access public --provenance
+
+      - name: Verify public installation
+        shell: bash
+        env:
+          NPM_CONFIG_USERCONFIG: /dev/null
+        run: |
+          package_name="$(node --print "require('./package.json').name")"
+          package_version="$(node --print "require('./package.json').version")"
+          package_spec="${package_name}@${package_version}"
+          visible=false
+          for attempt in {1..12}; do
+            if npm view "${package_spec}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+              visible=true
+              break
+            fi
+            sleep 5
+          done
+          if [[ "${visible}" != true ]]; then
+            echo "${package_spec} did not become publicly visible." >&2
+            exit 1
+          fi
+
+          temp_pi="$(mktemp -d)"
+          trap 'rm -rf "${temp_pi}"' EXIT
+          PI_CODING_AGENT_DIR="${temp_pi}" pnpm exec pi install "npm:${package_spec}"
+          PI_CODING_AGENT_DIR="${temp_pi}" pnpm exec pi list

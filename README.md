@@ -59,7 +59,6 @@ Project overrides belong in `.pi-loop.config.json`:
 
 ```sh
 pnpm install
-pnpm run effect:prepare
 pnpm run verify
 pnpm run pi:pack
 ```

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  copyFileSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
@@ -10,7 +11,7 @@ import {
   statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { parse } from "acorn";
 import config from "./config.mjs";
 import {
@@ -132,12 +133,21 @@ const verifyPackage = async () => {
     assert.equal(existsSync(join(packageRoot, "node_modules")), false);
     assert.equal(existsSync(join(packageRoot, "src")), false);
     const loader = await verifyWithPiLoader(packageRoot);
+    const requestedArchive = process.env.PI_PACKAGE_ARCHIVE;
+    const exportedArchive = requestedArchive ? resolve(projectRoot, requestedArchive) : undefined;
+    if (exportedArchive) {
+      mkdirSync(dirname(exportedArchive), { recursive: true });
+      copyFileSync(archive, exportedArchive);
+    }
     return {
       entry: contract.entryRelative,
       bundleBytes: statSync(contract.entryAbsolute).size,
       remainingImports: imports,
       packageFiles: files,
       loader,
+      ...(exportedArchive
+        ? { exportedArchive: relative(projectRoot, exportedArchive).split(sep).join("/") }
+        : {}),
     };
   } finally {
     rmSync(temporary, { recursive: true, force: true });

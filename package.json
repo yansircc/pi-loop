@@ -27,7 +27,7 @@
   },
   "scripts": {
     "effect:prepare": "node scripts/prepare-effect-tsgo.mjs",
-    "verify": "vp run quality",
+    "verify": "pnpm run effect:prepare && vp run quality",
     "test": "vp test",
     "pi:build": "node scripts/pi-extension/build.mjs",
     "pi:bundle-check": "node scripts/pi-extension/verify-distribution.mjs bundle",
@@ -42,6 +42,7 @@
     "@effect/vitest": "4.0.0-beta.97",
     "@sinclair/typebox": "0.34.41",
     "@types/node": "22.20.1",
+    "@yansircc/effect-scan": "0.1.2",
     "acorn": "8.15.0",
     "effect": "4.0.0-beta.97",
     "typescript": "7.0.2",

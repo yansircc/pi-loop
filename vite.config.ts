@@ -14,7 +14,7 @@ export default defineConfig({
       build: { command: "pnpm run pi:build", cache: false },
       typecheck: { command: "tsc --noEmit", cache: false },
       "lint:effect": {
-        command: "effect-skill-scan . --strict --output gate-json --evidence .effect-evidence",
+        command: "effect-scan . --strict --output gate-json --evidence .effect-evidence",
         cache: false,
       },
       "package:artifact": { command: "pnpm run pi:distribution-check", cache: false },
