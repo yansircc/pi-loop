@@ -5,20 +5,19 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'release-main' || format('{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 jobs:
   verify:
     name: Verify
+    if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -35,39 +34,83 @@ jobs:
           node-version: 24.11.0
           cache: pnpm
 
-      - name: Validate release tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: |
-          package_name="$(node --print "require('./package.json').name")"
-          package_version="$(node --print "require('./package.json').version")"
-          expected_tag="v${package_version}"
-          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match package version ${package_version}." >&2
-            exit 1
-          fi
-          view_error="$(mktemp)"
-          if npm view "${package_name}@${package_version}" version --registry=https://registry.npmjs.org/ >/dev/null 2>"${view_error}"; then
-            echo "${package_name}@${package_version} is already published." >&2
-            exit 1
-          fi
-          if ! grep -q 'E404' "${view_error}"; then
-            cat "${view_error}" >&2
-            echo "Could not prove ${package_name}@${package_version} is unpublished." >&2
-            exit 1
-          fi
-          rm -f "${view_error}"
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Verify package
+        run: pnpm run verify
+
+  release:
+    name: Prepare release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+
+    outputs:
+      name: ${{ steps.release.outputs.name }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.11.0
+          cache: pnpm
+
+      - name: Synchronize release branch
+        run: |
+          git fetch origin main --tags
+          git checkout -B main origin/main
+
+      - name: Prepare release version
+        id: release
+        run: node scripts/release/prepare.mjs "${GITHUB_SHA}"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify release archive
         env:
           PI_PACKAGE_ARCHIVE: release/package.tgz
         run: pnpm run verify
 
-      - name: Upload release archive
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Commit and tag release
+        if: steps.release.outputs.mode == 'new'
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+          BUMP: ${{ steps.release.outputs.bump }}
+          SOURCE_SHA: ${{ steps.release.outputs.sourceSha }}
+        run: |
+          changed="$(git diff --name-only)"
+          if [[ "${changed}" != "package.json" ]]; then
+            echo "Release preparation changed unexpected files: ${changed}" >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit \
+            -m "chore(release): v${VERSION}" \
+            -m "Release-Source: ${SOURCE_SHA}" \
+            -m "Release-Bump: ${BUMP}"
+          git tag -a "${TAG}" -m "${TAG}"
+          git push --atomic origin HEAD:main "refs/tags/${TAG}"
+
+      - name: Upload verified archive
         uses: actions/upload-artifact@v7
         with:
           name: npm-package-${{ github.sha }}
@@ -77,8 +120,7 @@ jobs:
 
   publish:
     name: Publish npm package
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: verify
+    needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -99,24 +141,54 @@ jobs:
           name: npm-package-${{ github.sha }}
           path: release
 
-      - name: Publish verified archive
+      - name: Install and publish verified archive
         shell: bash
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          archive="./release/package.tgz"
           install_root="$(mktemp -d)"
-          trap 'rm -rf "${install_root}"' EXIT
-          npm install ./release/package.tgz \
+          view_error="$(mktemp)"
+          trap 'rm -rf "${install_root}" "${view_error}"' EXIT
+          npm install "${archive}" \
             --prefix "${install_root}" \
             --legacy-peer-deps \
             --ignore-scripts=false \
             --no-audit \
             --no-fund
-          npm publish ./release/package.tgz --access public --provenance
+
+          read_field() {
+            tar -xOf "${archive}" package/package.json | node -e '
+              let input = "";
+              process.stdin.setEncoding("utf8");
+              process.stdin.on("data", (chunk) => { input += chunk; });
+              process.stdin.on("end", () => { process.stdout.write(String(JSON.parse(input)[process.argv[1]])); });
+            ' "$1"
+          }
+          package_name="$(read_field name)"
+          package_version="$(read_field version)"
+          package_spec="${package_name}@${package_version}"
+          local_integrity="sha512-$(openssl dgst -sha512 -binary "${archive}" | openssl base64 -A)"
+
+          if remote_json="$(npm view "${package_spec}" dist.integrity --json --registry=https://registry.npmjs.org/ 2>"${view_error}")"; then
+            remote_integrity="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]))' "${remote_json}")"
+            if [[ "${remote_integrity}" != "${local_integrity}" ]]; then
+              echo "Published ${package_spec} does not match the verified archive." >&2
+              exit 1
+            fi
+            echo "${package_spec} is already published with the verified archive."
+            exit 0
+          fi
+          if ! grep -q 'E404' "${view_error}"; then
+            cat "${view_error}" >&2
+            echo "Could not determine whether ${package_spec} is published." >&2
+            exit 1
+          fi
+          npm publish "${archive}" --access public --provenance
 
   verify-public:
     name: Verify public package
-    needs: publish
+    needs:
+      - release
+      - publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -143,24 +215,22 @@ jobs:
         shell: bash
         env:
           NPM_CONFIG_USERCONFIG: /dev/null
+          PACKAGE_SPEC: ${{ needs.release.outputs.name }}@${{ needs.release.outputs.version }}
         run: |
-          package_name="$(node --print "require('./package.json').name")"
-          package_version="$(node --print "require('./package.json').version")"
-          package_spec="${package_name}@${package_version}"
           visible=false
           for attempt in {1..60}; do
-            if npm view "${package_spec}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+            if npm view "${PACKAGE_SPEC}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
               visible=true
               break
             fi
             sleep 5
           done
           if [[ "${visible}" != true ]]; then
-            echo "${package_spec} did not become publicly visible." >&2
+            echo "${PACKAGE_SPEC} did not become publicly visible." >&2
             exit 1
           fi
 
           temp_pi="$(mktemp -d)"
           trap 'rm -rf "${temp_pi}"' EXIT
-          PI_CODING_AGENT_DIR="${temp_pi}" pnpm exec pi install "npm:${package_spec}"
+          PI_CODING_AGENT_DIR="${temp_pi}" pnpm exec pi install "npm:${PACKAGE_SPEC}"
           PI_CODING_AGENT_DIR="${temp_pi}" pnpm exec pi list

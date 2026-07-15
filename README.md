@@ -70,3 +70,16 @@ pnpm run pi:pack
 
 The package gate builds one self-contained Node ESM entry, packs it, extracts it without installing
 dependencies, and loads it through Pi's real extension loader.
+
+## Releases
+
+Every push to `main` publishes the next patch version after verification. Add one commit trailer to
+select a larger SemVer increment:
+
+```text
+Release-Bump: minor
+Release-Bump: major
+```
+
+CI owns the version commit and tag. Without a trailer, `0.4.1` becomes `0.4.2`; `minor` produces
+`0.5.0`, and `major` produces `1.0.0`.
