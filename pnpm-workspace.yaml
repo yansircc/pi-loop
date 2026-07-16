@@ -1,2 +1,10 @@
 packages:
   - "."
+
+allowBuilds:
+  "@google/genai": false
+  msgpackr-extract: false
+  protobufjs: false
+
+minimumReleaseAgeExclude:
+  - "@yansircc/effect-scan"

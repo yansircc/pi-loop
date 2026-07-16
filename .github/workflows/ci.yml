@@ -10,51 +10,21 @@ on:
 permissions:
   contents: read
 
+env:
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
 concurrency:
   group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]' && 'release-main' || format('{0}-{1}', github.workflow, github.ref) }}
   cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]') }}
 
 jobs:
-  verify:
-    name: Verify (${{ matrix.os }})
-    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v6
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24.11.0
-          cache: pnpm
-
-      - name: Install dependencies
-        run: |
-          pnpm install --frozen-lockfile
-
-      - name: Verify package
-        run: |
-          pnpm run verify
-
-  release:
-    name: Prepare release
-    needs: verify
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
+  candidate:
+    name: Verify release candidate
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     permissions:
       contents: read
@@ -82,26 +52,26 @@ jobs:
         with:
           node-version: 24.11.0
           cache: pnpm
-          registry-url: https://registry.npmjs.org
 
-      - name: Synchronize release branch
+      - name: Check out the event source
         run: |
           git fetch origin main --tags
           git checkout --detach "${GITHUB_SHA}"
 
       - name: Prepare release version
         id: release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: node scripts/release/prepare.mjs "${GITHUB_SHA}"
 
       - name: Install dependencies
         run: |
           pnpm install --frozen-lockfile
 
-      - name: Verify package
+      - name: Verify source
         run: |
           pnpm run verify
 
-      - name: Pack and install the verified archive
+      - name: Pack candidate once
         shell: bash
         run: |
           mkdir -p release
@@ -112,15 +82,11 @@ jobs:
             exit 1
           fi
           mv "${archives[0]}" release/package.tgz
-          install_root="$(mktemp -d)"
-          trap 'rm -rf "${install_root}"' EXIT
-          npm install ./release/package.tgz \
-            --prefix "${install_root}" \
-            --ignore-scripts=false \
-            --no-audit \
-            --no-fund
 
-      - name: Upload verified archive
+      - name: Verify candidate baseline
+        run: pnpm run release:archive-check -- release/package.tgz
+
+      - name: Upload verified candidate
         uses: actions/upload-artifact@v7
         with:
           name: npm-package-${{ github.sha }}
@@ -128,16 +94,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  verify_archive:
-    name: Verify release archive (${{ matrix.os }})
-    needs: release
+  verify_platform:
+    name: Verify candidate portability (${{ matrix.os }})
+    needs: candidate
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        include:
+          - os: macos-latest
+            script: release:platform-check
+          - os: windows-latest
+            script: release:platform-check
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
 
@@ -157,24 +124,26 @@ jobs:
           node-version: 24.11.0
           cache: pnpm
 
-      - name: Install dependencies
+      - name: Install harness dependencies
         run: |
           pnpm install --frozen-lockfile
 
-      - name: Download verified archive
+      - name: Download verified candidate
         uses: actions/download-artifact@v8
         with:
           name: npm-package-${{ github.sha }}
           path: release
 
-      - name: Verify exact release archive
-        run: pnpm run release:archive-check -- release/package.tgz
+      - name: Verify exact candidate
+        run: pnpm run ${{ matrix.script }} -- release/package.tgz
+
   commit_release:
     name: Commit and tag release
     needs:
-      - release
-      - verify_archive
+      - candidate
+      - verify_platform
 
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -195,7 +164,7 @@ jobs:
       - name: Reproduce release version
         id: release
         env:
-          SOURCE_SHA: ${{ needs.release.outputs.source_sha }}
+          SOURCE_SHA: ${{ needs.candidate.outputs.source_sha }}
         run: |
           git fetch origin main --tags
           git checkout --detach "${SOURCE_SHA}"
@@ -211,13 +180,13 @@ jobs:
           ACTUAL_BUMP: ${{ steps.release.outputs.bump }}
           ACTUAL_SOURCE_SHA: ${{ steps.release.outputs.sourceSha }}
           ACTUAL_RELEASE_FILES: ${{ steps.release.outputs.releaseFiles }}
-          EXPECTED_NAME: ${{ needs.release.outputs.name }}
-          EXPECTED_VERSION: ${{ needs.release.outputs.version }}
-          EXPECTED_TAG: ${{ needs.release.outputs.tag }}
-          EXPECTED_MODE: ${{ needs.release.outputs.mode }}
-          EXPECTED_BUMP: ${{ needs.release.outputs.bump }}
-          EXPECTED_SOURCE_SHA: ${{ needs.release.outputs.source_sha }}
-          EXPECTED_RELEASE_FILES: ${{ needs.release.outputs.release_files }}
+          EXPECTED_NAME: ${{ needs.candidate.outputs.name }}
+          EXPECTED_VERSION: ${{ needs.candidate.outputs.version }}
+          EXPECTED_TAG: ${{ needs.candidate.outputs.tag }}
+          EXPECTED_MODE: ${{ needs.candidate.outputs.mode }}
+          EXPECTED_BUMP: ${{ needs.candidate.outputs.bump }}
+          EXPECTED_SOURCE_SHA: ${{ needs.candidate.outputs.source_sha }}
+          EXPECTED_RELEASE_FILES: ${{ needs.candidate.outputs.release_files }}
         run: |
           test "${ACTUAL_NAME}" = "${EXPECTED_NAME}"
           test "${ACTUAL_VERSION}" = "${EXPECTED_VERSION}"
@@ -258,10 +227,11 @@ jobs:
   publish:
     name: Publish npm package
     needs:
-      - release
-      - verify_archive
+      - candidate
+      - verify_platform
 
       - commit_release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -274,26 +244,19 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24.11.0
-          registry-url: https://registry.npmjs.org
 
-      - name: Download verified archive
+      - name: Download verified candidate
         uses: actions/download-artifact@v8
         with:
           name: npm-package-${{ github.sha }}
           path: release
 
-      - name: Install and publish verified archive
+      - name: Publish verified candidate
         shell: bash
         run: |
           archive="./release/package.tgz"
-          install_root="$(mktemp -d)"
           view_error="$(mktemp)"
-          trap 'rm -rf "${install_root}" "${view_error}"' EXIT
-          npm install "${archive}" \
-            --prefix "${install_root}" \
-            --ignore-scripts=false \
-            --no-audit \
-            --no-fund
+          trap 'rm -f "${view_error}"' EXIT
 
           read_field() {
             tar -xOf "${archive}" package/package.json | node -e '
@@ -311,10 +274,10 @@ jobs:
           if remote_json="$(npm view "${package_spec}" dist.integrity --json --registry=https://registry.npmjs.org/ 2>"${view_error}")"; then
             remote_integrity="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]))' "${remote_json}")"
             if [[ "${remote_integrity}" != "${local_integrity}" ]]; then
-              echo "Published ${package_spec} does not match the verified archive." >&2
+              echo "Published ${package_spec} does not match the verified candidate." >&2
               exit 1
             fi
-            echo "${package_spec} is already published with the verified archive."
+            echo "${package_spec} is already published with the verified candidate."
             exit 0
           fi
           if ! grep -q 'E404' "${view_error}"; then
@@ -322,38 +285,27 @@ jobs:
             echo "Could not determine whether ${package_spec} is published." >&2
             exit 1
           fi
-          npm publish "${archive}" --access public --provenance
+          npm publish "${archive}" --access public --provenance --registry=https://registry.npmjs.org/
 
   verify-public:
-    name: Verify public package
+    name: Verify public projection
     needs:
-      - release
+      - candidate
       - publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     permissions:
       contents: read
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v6
-
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 24.11.0
-          cache: pnpm
-          registry-url: https://registry.npmjs.org
 
-      - name: Install dependencies
-        run: |
-          pnpm install --frozen-lockfile
-
-      - name: Download verified archive
+      - name: Download verified candidate
         uses: actions/download-artifact@v8
         with:
           name: npm-package-${{ github.sha }}
@@ -363,7 +315,7 @@ jobs:
         shell: bash
         env:
           NPM_CONFIG_USERCONFIG: /dev/null
-          PACKAGE_SPEC: ${{ needs.release.outputs.name }}@${{ needs.release.outputs.version }}
+          PACKAGE_SPEC: ${{ needs.candidate.outputs.name }}@${{ needs.candidate.outputs.version }}
         run: |
           local_integrity="sha512-$(openssl dgst -sha512 -binary ./release/package.tgz | openssl base64 -A)"
           remote_integrity=""
@@ -379,7 +331,7 @@ jobs:
             exit 1
           fi
           if [[ "${remote_integrity}" != "${local_integrity}" ]]; then
-            echo "Public ${PACKAGE_SPEC} does not match the verified archive." >&2
+            echo "Public ${PACKAGE_SPEC} does not match the verified candidate." >&2
             exit 1
           fi
           install_root="$(mktemp -d)"
@@ -388,21 +340,5 @@ jobs:
             --prefix "${install_root}" \
             --ignore-scripts=false \
             --no-audit \
-            --no-fund
-
-      - name: Fetch public archive
-        shell: bash
-        env:
-          PACKAGE_SPEC: ${{ needs.release.outputs.name }}@${{ needs.release.outputs.version }}
-        run: |
-          mkdir -p public-release
-          npm pack "${PACKAGE_SPEC}" --pack-destination public-release
-          mapfile -t archives < <(find public-release -maxdepth 1 -type f -name '*.tgz')
-          if [[ "${#archives[@]}" -ne 1 ]]; then
-            echo "Expected one public npm archive, found ${#archives[@]}." >&2
-            exit 1
-          fi
-          mv "${archives[0]}" public-release/package.tgz
-
-      - name: Verify public archive
-        run: pnpm run release:public-check -- public-release/package.tgz
+            --no-fund \
+            --registry=https://registry.npmjs.org/

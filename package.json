@@ -33,10 +33,10 @@
     "pi:build": "node scripts/pi-extension/build.mjs",
     "pi:bundle-check": "node scripts/pi-extension/verify-distribution.mjs bundle",
     "pi:distribution-check": "node scripts/pi-extension/verify-distribution.mjs package",
-    "pi:verify": "pnpm run pi:build && pnpm run pi:distribution-check",
+    "pi:verify": "pnpm run pi:build && pnpm run pi:bundle-check",
     "pi:domain-check": "node scripts/domain/verify-extension.mjs",
     "release:archive-check": "node scripts/pi-extension/verify-distribution.mjs archive",
-    "release:public-check": "node scripts/pi-extension/verify-distribution.mjs public"
+    "release:platform-check": "node scripts/pi-extension/verify-distribution.mjs platform"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.80.6",
@@ -66,7 +66,7 @@
   "engines": {
     "node": "^22.19.0 || >=24.11.0"
   },
-  "packageManager": "pnpm@10.11.0",
+  "packageManager": "pnpm@11.13.1",
   "pi": {
     "extensions": [
       "./dist/pi/extension.js"

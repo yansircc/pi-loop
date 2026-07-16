@@ -286,8 +286,8 @@ const packCurrentOutput = () => {
 
 const mode = process.argv[2];
 assert.ok(
-  new Set(["bundle", "package", "archive", "public"]).has(mode),
-  "usage: verify-distribution.mjs bundle|package|archive <path>|public <path>",
+  new Set(["bundle", "package", "archive", "platform"]).has(mode),
+  "usage: verify-distribution.mjs bundle|package|archive <path>|platform <path>",
 );
 
 let result;
